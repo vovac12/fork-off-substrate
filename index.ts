@@ -1,13 +1,14 @@
-const fs = require('fs');
-const path = require('path');
-const chalk = require('chalk');
-const cliProgress = require('cli-progress');
+import * as fs from 'fs';
+import * as path from 'path';
+import * as chalk from 'chalk';
+import * as cliProgress from 'cli-progress';
 require("dotenv").config();
-const { ApiPromise } = require('@polkadot/api');
-const { HttpProvider } = require('@polkadot/rpc-provider');
-const { xxhashAsHex } = require('@polkadot/util-crypto');
-const execFileSync = require('child_process').execFileSync;
-const execSync = require('child_process').execSync;
+import { api, connection } from '@sora-substrate/util';
+import { xxhashAsHex } from '@polkadot/util-crypto';
+import { execFileSync, execSync } from 'child_process';
+import * as codec from '@polkadot/types/codec';
+import * as runtime from '@polkadot/types/interfaces/runtime';
+import * as primitive from '@polkadot/types/primitive';
 const binaryPath = path.join(__dirname, 'data', 'binary');
 const wasmPath = path.join(__dirname, 'data', 'runtime.wasm');
 const schemaPath = path.join(__dirname, 'data', 'schema.json');
@@ -15,11 +16,13 @@ const hexPath = path.join(__dirname, 'data', 'runtime.hex');
 const originalSpecPath = path.join(__dirname, 'data', 'genesis.json');
 const forkedSpecPath = path.join(__dirname, 'data', 'fork.json');
 const storagePath = path.join(__dirname, 'data', 'storage.json');
+const keysPath = path.join(__dirname, 'data', 'keys.json');
 
+const ENDPOINT = 'wss://mof3.sora.org';
 // Using http endpoint since substrate's Ws endpoint has a size limit.
-const provider = new HttpProvider(process.env.HTTP_RPC_ENDPOINT || 'http://localhost:9933')
+const HTTP_ENDPOINT = process.env.HTTP_RPC_ENDPOINT || ENDPOINT;
 // The storage download will be split into 256^chunksLevel chunks.
-const chunksLevel = process.env.FORK_CHUNKS_LEVEL || 1;
+const chunksLevel = +(process.env.FORK_CHUNKS_LEVEL || 1);
 const totalChunks = Math.pow(256, chunksLevel);
 
 const alice = process.env.ALICE || ''
@@ -46,7 +49,7 @@ const progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_cla
 let prefixes = ['0x26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9' /* System.Account */];
 const skippedModulesPrefix = ['System', 'Session', 'Babe', 'Grandpa', 'GrandpaFinality', 'FinalityTracker', 'Authorship'];
 
-async function fixParachinStates (api, forkedSpec) {
+async function fixParachinStates(api, forkedSpec) {
   const skippedKeys = [
     api.query.parasScheduler.sessionStartBlock.key()
   ];
@@ -55,7 +58,15 @@ async function fixParachinStates (api, forkedSpec) {
   }
 }
 
+class KeysFile {
+  at: string;
+  keys: string[];
+}
+
 async function main() {
+  await connection.open(HTTP_ENDPOINT);
+  api.initialize();
+  console.log('Connected to:', HTTP_ENDPOINT);
   if (!fs.existsSync(binaryPath)) {
     console.log(chalk.red('Binary missing. Please copy the binary of your substrate node to the data folder and rename the binary to "binary"'));
     process.exit(1);
@@ -68,59 +79,72 @@ async function main() {
   }
   execSync('cat ' + wasmPath + ' | hexdump -ve \'/1 "%02x"\' > ' + hexPath);
 
-  let api;
-  console.log(chalk.green('We are intentionally using the HTTP endpoint. If you see any warnings about that, please ignore them.'));
-  if (!fs.existsSync(schemaPath)) {
-    console.log(chalk.yellow('Custom Schema missing, using default schema.'));
-    api = await ApiPromise.create({ provider });
-  } else {
-    const { types, rpc } = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
-    api = await ApiPromise.create({
-      provider,
-      types,
-      rpc,
-    });
-  }
-
-  if (fs.existsSync(storagePath)) {
-    console.log(chalk.yellow('Reusing cached storage. Delete ./data/storage.json and rerun the script if you want to fetch latest storage'));
-  } else {
-    // Download state of original chain
-    console.log(chalk.green('Fetching current state of the live chain. Please wait, it can take a while depending on the size of your chain.'));
-    let at = (await api.rpc.chain.getBlockHash()).toString();
-    progressBar.start(totalChunks, 0);
-    const stream = fs.createWriteStream(storagePath, { flags: 'a' });
-    stream.write("[");
-    await fetchChunks("0x", chunksLevel, stream, at);
-    stream.write("]");
-    stream.end();
-    progressBar.stop();
-  }
-
-  const metadata = await api.rpc.state.getMetadata();
+  const metadata = await api.apiRx.rpc.state.getMetadata().toPromise();
   // Populate the prefixes array
-  const modules = metadata.asLatest.pallets;
+  let modulePrefixes: string[] = [];
+  const modules = metadata.asV12.modules;
   modules.forEach((module) => {
     if (module.storage) {
-      if (!skippedModulesPrefix.includes(module.name)) {
-        prefixes.push(xxhashAsHex(module.name, 128));
+      modulePrefixes.push(xxhashAsHex(module.name.toString(), 128));
+      if (!skippedModulesPrefix.includes(module.name.toString())) {
+        prefixes.push(xxhashAsHex(module.name.toString(), 128));
       }
     }
   });
 
-  // Generate chain spec for original and forked chains
-  if (originalChain == '') {
-    execSync(binaryPath + ` build-spec --raw > ` + originalSpecPath);
+  if (fs.existsSync(keysPath)) {
+    console.log(chalk.yellow('Reusing cached keys. Delete ./data/keys.json and rerun the script if you want to fetch latest keys'));
   } else {
-    execSync(binaryPath + ` build-spec --chain ${originalChain} --raw > ` + originalSpecPath);
+    let at = (await api.apiRx.rpc.chain.getBlockHash().toPromise()).toString();
+    const keys = await fetchKeys("0x", at);
+    fs.writeFileSync(keysPath, JSON.stringify({ keys, at }, null, 2));
   }
+  let { keys, at }: KeysFile = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  console.log("Loaded keys: ", keys.length);
+
+  if (fs.existsSync(storagePath)) {
+    let storage = new Set();
+    fs.readFileSync(storagePath, 'utf8').split('\n').forEach((line) => {
+      if (line.length > 0) {
+        storage.add(JSON.parse(line)[0]);
+      }
+    });
+
+    keys = keys.filter((key) => !storage.has(key));
+  }
+
+  console.log("Remaining keys: ", keys.length);
+
+  if (keys.length > 0) {
+    // Download state of original chain
+    console.log(chalk.green('Fetching current state of the live chain. Please wait, it can take a while depending on the size of your chain.'));
+    progressBar.start(keys.length, 0);
+    const stream = fs.createWriteStream(storagePath, { flags: 'a' });
+    await fetchChunks(keys, stream, at);
+    stream.end();
+    progressBar.stop();
+  }
+
+  // Generate chain spec for original and forked chains
+  // if (originalChain == '') {
+  //   execSync(binaryPath + ` build-spec --raw > ` + originalSpecPath);
+  // } else {
+  //   execSync(binaryPath + ` build-spec --chain ${originalChain} --raw > ` + originalSpecPath);
+  // }
   if (forkChain == '') {
-    execSync(binaryPath + ` build-spec --dev --raw > ` + forkedSpecPath);
+    execSync(binaryPath + ` build-spec --chain local --raw > ` + forkedSpecPath);
   } else {
     execSync(binaryPath + ` build-spec --chain ${forkChain} --raw > ` + forkedSpecPath);
   }
 
-  let storage = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
+  let storage = [];
+  {
+    fs.readFileSync(storagePath, 'utf8').split('\n').forEach((line) => {
+      if (line.length > 0) {
+        storage.push(JSON.parse(line));
+      }
+    });
+  }
   let originalSpec = JSON.parse(fs.readFileSync(originalSpecPath, 'utf8'));
   let forkedSpec = JSON.parse(fs.readFileSync(forkedSpecPath, 'utf8'));
 
@@ -137,7 +161,7 @@ async function main() {
   // Delete System.LastRuntimeUpgrade to ensure that the on_runtime_upgrade event is triggered
   delete forkedSpec.genesis.raw.top['0x26aa394eea5630e07c48ae0c9558cef7f9cce9c888469bb1a0dceaa129672ef8'];
 
-  fixParachinStates(api, forkedSpec);
+  // fixParachinStates(api, forkedSpec);
 
   // Set the code to the current runtime code
   forkedSpec.genesis.raw.top['0x3a636f6465'] = '0x' + fs.readFileSync(hexPath, 'utf8').trim();
@@ -145,10 +169,7 @@ async function main() {
   // To prevent the validator set from changing mid-test, set Staking.ForceEra to ForceNone ('0x02')
   forkedSpec.genesis.raw.top['0x5f3e4907f716ac89b6347d15ececedcaf7dad0317324aecae8744b87fc95f2f3'] = '0x02';
 
-  if (alice !== '') {
-    // Set sudo key to //Alice
-    forkedSpec.genesis.raw.top['0x5c0d1176a568c1f92944340dbfed9e9c530ebca703c85910e7164cb7d1c9e47b'] = '0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d';
-  }
+  forkedSpec.genesis.raw.top['0x5c0d1176a568c1f92944340dbfed9e9c530ebca703c85910e7164cb7d1c9e47b'] = '0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d';
 
   fs.writeFileSync(forkedSpecPath, JSON.stringify(forkedSpec, null, 4));
 
@@ -158,27 +179,30 @@ async function main() {
 
 main();
 
-async function fetchChunks(prefix, levelsRemaining, stream, at) {
-  if (levelsRemaining <= 0) {
-    const pairs = await provider.send('state_getPairs', [prefix, at]);
-    if (pairs.length > 0) {
-      separator ? stream.write(",") : separator = true;
-      stream.write(JSON.stringify(pairs).slice(1, -1));
+async function fetchChunks(keys: string[], stream, at) {
+  for (let i = 0; i < keys.length; i++) {
+    const batch = keys.slice(i, i + 1);
+    const values = await api.apiRx.rpc.state.queryStorageAt(batch, at).toPromise() as codec.Option<runtime.StorageData>;
+    for (let j = 0; j < batch.length; j++) {
+      stream.write(JSON.stringify([batch[j], values[j].toString()]) + '\n');
     }
-    progressBar.update(++chunksFetched);
-    return;
+    chunksFetched += 1;
+    progressBar.update(chunksFetched);
   }
+  return;
+}
 
-  // Async fetch the last level
-  if (process.env.QUICK_MODE && levelsRemaining == 1) {
-    let promises = [];
-    for (let i = 0; i < 256; i++) {
-      promises.push(fetchChunks(prefix + i.toString(16).padStart(2, "0"), levelsRemaining - 1, stream, at));
+async function fetchKeys(prefix: string, at): Promise<primitive.StorageKey[]> {
+  let keys = [];
+  let startKey;
+  while (true) {
+    let new_keys = (await api.apiRx.rpc.state.getKeysPaged(prefix, 1000, startKey, at).toPromise()).toArray();
+    if (new_keys.length == 0) {
+      break;
     }
-    await Promise.all(promises);
-  } else {
-    for (let i = 0; i < 256; i++) {
-      await fetchChunks(prefix + i.toString(16).padStart(2, "0"), levelsRemaining - 1, stream, at);
-    }
+    startKey = new_keys[new_keys.length - 1];
+    keys.push(...new_keys);
+    console.log(`Fetched ${new_keys.length} keys, total: ${keys.length}`);
   }
+  return keys;
 }

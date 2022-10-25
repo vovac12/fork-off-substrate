@@ -1,0 +1,18 @@
+{
+    "compilerOptions": {
+        "strict": false,
+        "noImplicitAny": false,
+        "noUnusedLocals": false,
+        "downlevelIteration": true,
+        "baseUrl": ".",
+        "skipLibCheck": true,
+        "typeRoots": [
+            "./node_modules/@polkadot/ts",
+            "./node_modules/@types"
+        ]
+    },
+    "exclude": [
+        "build/**/*",
+        "**/build/**/*"
+    ]
+}
