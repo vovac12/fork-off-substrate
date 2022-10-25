@@ -18,7 +18,7 @@ const forkedSpecPath = path.join(__dirname, 'data', 'fork.json');
 const storagePath = path.join(__dirname, 'data', 'storage.json');
 const keysPath = path.join(__dirname, 'data', 'keys.json');
 
-const ENDPOINT = 'wss://mof3.sora.org';
+const ENDPOINT = 'wss://ws.framenode-1.v1.tst.sora2.soramitsu.co.jp';
 // Using http endpoint since substrate's Ws endpoint has a size limit.
 const HTTP_ENDPOINT = process.env.HTTP_RPC_ENDPOINT || ENDPOINT;
 // The storage download will be split into 256^chunksLevel chunks.
@@ -82,7 +82,7 @@ async function main() {
   const metadata = await api.apiRx.rpc.state.getMetadata().toPromise();
   // Populate the prefixes array
   let modulePrefixes: string[] = [];
-  const modules = metadata.asV12.modules;
+  const modules = metadata.asV14.pallets;
   modules.forEach((module) => {
     if (module.storage) {
       modulePrefixes.push(xxhashAsHex(module.name.toString(), 128));
@@ -180,13 +180,14 @@ async function main() {
 main();
 
 async function fetchChunks(keys: string[], stream, at) {
-  for (let i = 0; i < keys.length; i++) {
-    const batch = keys.slice(i, i + 1);
+  let batchSize = 100;
+  for (let i = 0; i < keys.length; i+=batchSize) {
+    const batch = keys.slice(i, Math.min(i + batchSize, keys.length - 1));
     const values = await api.apiRx.rpc.state.queryStorageAt(batch, at).toPromise() as codec.Option<runtime.StorageData>;
     for (let j = 0; j < batch.length; j++) {
       stream.write(JSON.stringify([batch[j], values[j].toString()]) + '\n');
     }
-    chunksFetched += 1;
+    chunksFetched += batchSize;
     progressBar.update(chunksFetched);
   }
   return;
